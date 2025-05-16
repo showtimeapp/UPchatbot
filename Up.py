@@ -5,12 +5,25 @@ import json
 import re
 import streamlit as st
 import requests
+import google.generativeai as genai
+import matplotlib.pyplot as plt
+import seaborn as sns
+import wikipedia
+import plotly.express as px
+import plotly.graph_objects as go
 from typing import List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables if using a .env file
 load_dotenv()
+
+# Configure API keys
+GROQ_API_KEY = "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"
+GEMINI_API_KEY = "AIzaSyBHBFb7iJ4VNSazi_oNZ50pwSo8suH7Y4M"
+
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
 
 class ElectoralDataAnalyzer:
     def __init__(self, csv_path, db_path=None):
@@ -29,7 +42,8 @@ class ElectoralDataAnalyzer:
         self.table_name = "electoral_data"
         
         # Get API key from environment or Streamlit secrets
-        self.api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
+        self.groq_api_key = GROQ_API_KEY
+        self.gemini_api_key = GEMINI_API_KEY
         
         # Store original column names and their lowercase versions for mapping
         self.column_mapping = {}
@@ -80,9 +94,12 @@ class ElectoralDataAnalyzer:
                 'Rank': 'int',
                 'Valid_Votes': 'int',
                 'Vote_Share_Percentage': 'float',
+                'Voteshare_Percentage': 'float',
                 'Margin': 'float',
                 'Margin_Percentage': 'float',
-                'ENOP': 'float'
+                'Margin_Per': 'float',
+                'ENOP': 'float',
+                'Turnout_Percentage': 'float'
             }
             
             # Apply type conversions
@@ -160,17 +177,23 @@ class ElectoralDataAnalyzer:
             'ac_no': 'INTEGER',
             'pc_no': 'INTEGER',
             'constituency_type': 'TEXT',
+            'ac_type': 'TEXT',
             'candid': 'INTEGER',
             'candidate': 'TEXT',
+            'candidate_name': 'TEXT',
             'party': 'TEXT',
             'votes': 'INTEGER',
             'rank': 'INTEGER',
             'valid_votes': 'INTEGER',
+            'electors': 'INTEGER',
             'vote_share_percentage': 'REAL',
+            'voteshare_percentage': 'REAL',
             'margin': 'REAL',
             'margin_percentage': 'REAL',
+            'margin_per': 'REAL',
             'enop': 'REAL',
-            'candidate_type': 'TEXT'
+            'candidate_type': 'TEXT',
+            'turnout_percentage': 'REAL'
         }
         
         for col in self.df.columns:
@@ -307,12 +330,12 @@ EXPLANATION: <explanation of your approach>
 """
 
         # Check if API key is available
-        if not self.api_key:
+        if not self.groq_api_key:
             return "Error: Groq API key not found. Please set the GROQ_API_KEY environment variable or provide it in Streamlit secrets."
         
         # Make API call to Groq
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.groq_api_key}",
             "Content-Type": "application/json"
         }
         
@@ -382,8 +405,245 @@ EXPLANATION: <explanation of your approach>
             "current_columns": self.df.columns.tolist() if hasattr(self, 'df') else [],
             "column_mapping": self.column_mapping if hasattr(self, 'column_mapping') else {}
         }
+    
+    def generate_gemini_analysis(self, user_query, sql_result_df):
+        """Generate additional analysis using Google's Gemini API."""
+        try:
+            # Convert DataFrame to a string representation
+            if isinstance(sql_result_df, pd.DataFrame):
+                data_str = sql_result_df.to_string()
+                if len(data_str) > 10000:  # Limit data size for API
+                    data_str = sql_result_df.head(50).to_string() + "\n[...truncated for brevity...]"
+            else:
+                data_str = str(sql_result_df)
+            
+            # Create the prompt for Gemini
+            prompt = f"""
+You are an expert in Uttar Pradesh political data analyst. I have a query and its results from an electoral database:
 
-# Streamlit UI
+Query: "{user_query}"
+
+Results:
+{data_str}
+
+Please provide a detailed analysis of this data. Include:
+1. Key insights from the data
+2. Political trends or patterns
+3. Significance of these results in the electoral context
+4. Any recommendations for further analysis
+5. if you think the above data in result section is wrong then give your own analysis to the question. 
+
+Make your analysis concise but comprehensive.
+"""
+
+            # Set up Gemini model
+            generation_config = {
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 2048,
+            }
+            
+            # Get Gemini model
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash-002",
+                generation_config=generation_config
+            )
+            
+            # Generate response
+            with st.spinner("Generating additional analysis with Gemini..."):
+                response = model.generate_content(prompt)
+                
+            return response.text
+        except Exception as e:
+            return f"Error generating Gemini analysis: {str(e)}"
+    
+    def generate_visualization(self, df, user_query):
+        """Generate appropriate visualizations based on the data and query."""
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return None
+            
+            # Determine visualization type based on data and query
+            viz_type = None
+            
+            # Check for comparison queries (typically need bar charts)
+            comparison_patterns = ["compare", "versus", "vs", "difference", "ranking", "rank"]
+            if any(pattern in user_query.lower() for pattern in comparison_patterns):
+                viz_type = "bar"
+                
+            # Check for trend queries (typically need line charts)
+            trend_patterns = ["trend", "over time", "year", "years", "period"]
+            if any(pattern in user_query.lower() for pattern in trend_patterns):
+                viz_type = "line"
+                
+            # Check for distribution queries (pie charts or histograms)
+            distribution_patterns = ["distribution", "share", "percentage", "proportion"]
+            if any(pattern in user_query.lower() for pattern in distribution_patterns):
+                if df.shape[0] <= 10:  # Small number of categories
+                    viz_type = "pie"
+                else:
+                    viz_type = "histogram"
+            
+            # Default to bar chart for small datasets with categorical data
+            if viz_type is None:
+                if df.shape[0] <= 20:
+                    viz_type = "bar"
+                else:
+                    viz_type = "table"  # Just show the table for large datasets
+            
+            # Create visualization based on type
+            fig = None
+            
+            if viz_type == "bar":
+                # Try to intelligently determine x and y axes
+                categorical_columns = [col for col in df.columns if df[col].dtype == 'object']
+                numerical_columns = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+                
+                if categorical_columns and numerical_columns:
+                    # Choose the first categorical column for x-axis
+                    x_col = categorical_columns[0]
+                    
+                    # For y-axis, prefer columns with 'vote', 'margin', or 'percentage'
+                    y_col = None
+                    for col in numerical_columns:
+                        if any(term in col.lower() for term in ["vote", "margin", "percentage", "share"]):
+                            y_col = col
+                            break
+                    
+                    if y_col is None and numerical_columns:
+                        y_col = numerical_columns[0]
+                    
+                    if x_col and y_col:
+                        # Sort data by y_col for better visualization
+                        sorted_df = df.sort_values(by=y_col, ascending=False)
+                        
+                        # Create bar chart with Plotly
+                        fig = px.bar(
+                            sorted_df, 
+                            x=x_col, 
+                            y=y_col, 
+                            color=categorical_columns[0] if len(categorical_columns) > 1 else None,
+                            title=f"{y_col} by {x_col}",
+                            labels={x_col: x_col.replace('_', ' ').title(), y_col: y_col.replace('_', ' ').title()}
+                        )
+            
+            elif viz_type == "line":
+                # Try to find a date/year column for x-axis
+                time_cols = [col for col in df.columns if "year" in col.lower() or "date" in col.lower()]
+                numerical_columns = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+                
+                if time_cols and numerical_columns:
+                    x_col = time_cols[0]
+                    y_col = None
+                    
+                    # Find an appropriate y column (votes, percentage, etc.)
+                    for col in numerical_columns:
+                        if any(term in col.lower() for term in ["vote", "margin", "percentage", "share"]):
+                            y_col = col
+                            break
+                    
+                    if y_col is None and numerical_columns:
+                        y_col = numerical_columns[0]
+                    
+                    if x_col and y_col:
+                        # Create line chart with Plotly
+                        fig = px.line(
+                            df, 
+                            x=x_col, 
+                            y=y_col,
+                            color=df.columns[0] if len(df.columns) > 2 else None,
+                            title=f"{y_col} over {x_col}",
+                            labels={x_col: x_col.replace('_', ' ').title(), y_col: y_col.replace('_', ' ').title()}
+                        )
+            
+            elif viz_type == "pie":
+                # Choose columns for pie chart
+                categorical_cols = [col for col in df.columns if df[col].dtype == 'object']
+                numerical_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+                
+                if categorical_cols and numerical_cols:
+                    # Use the first categorical column for names
+                    names_col = categorical_cols[0]
+                    
+                    # Use the first numerical column for values
+                    value_col = None
+                    for col in numerical_cols:
+                        if any(term in col.lower() for term in ["vote", "margin", "percentage", "share"]):
+                            value_col = col
+                            break
+                    
+                    if value_col is None and numerical_cols:
+                        value_col = numerical_cols[0]
+                    
+                    if names_col and value_col:
+                        # Create pie chart with Plotly
+                        fig = px.pie(
+                            df, 
+                            names=names_col, 
+                            values=value_col,
+                            title=f"Distribution of {value_col} by {names_col}"
+                        )
+            
+            elif viz_type == "histogram":
+                # Choose column for histogram
+                numerical_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+                
+                if numerical_cols:
+                    # Choose a numerical column, preferring vote-related ones
+                    hist_col = None
+                    for col in numerical_cols:
+                        if any(term in col.lower() for term in ["vote", "margin", "percentage", "share"]):
+                            hist_col = col
+                            break
+                    
+                    if hist_col is None:
+                        hist_col = numerical_cols[0]
+                    
+                    # Create histogram with Plotly
+                    fig = px.histogram(
+                        df, 
+                        x=hist_col,
+                        title=f"Distribution of {hist_col}",
+                        labels={hist_col: hist_col.replace('_', ' ').title()}
+                    )
+            
+            return fig
+            
+        except Exception as e:
+            st.error(f"Error generating visualization: {str(e)}")
+            return None
+
+    def get_candidate_info(self, candidate_name):
+        """Get information about a candidate from Wikipedia."""
+        try:
+            # Search for the candidate on Wikipedia
+            search_results = wikipedia.search(f"{candidate_name} politician India")
+            
+            if not search_results:
+                return f"No Wikipedia information found for {candidate_name}."
+            
+            # Try to get a page about the candidate
+            try:
+                page = wikipedia.page(search_results[0], auto_suggest=False)
+            except wikipedia.exceptions.DisambiguationError as e:
+                # If disambiguation page, try the first option
+                page = wikipedia.page(e.options[0], auto_suggest=False)
+            except Exception:
+                return f"Could not retrieve detailed information for {candidate_name}."
+            
+            # Get a summary of the page
+            summary = wikipedia.summary(page.title, sentences=5)
+            
+            return {
+                "name": page.title,
+                "summary": summary,
+                "url": page.url
+            }
+        except Exception as e:
+            return f"Error retrieving information: {str(e)}"
+
+
 def main():
     st.set_page_config(
         page_title="Electoral Data Analyzer",
@@ -391,8 +651,8 @@ def main():
         layout="wide"
     )
     
-    st.title("📊 Electoral Data Analyzer")
-    st.subheader("Analyze electoral data using natural language questions")
+    st.title("📊 Showtime Uttar Pradesh Electoral Data Analyzer")
+    st.subheader("Analyze using natural language questions")
     
     # Add description based on the sample data
     st.markdown("""
@@ -404,37 +664,8 @@ def main():
     - **Candidate details**: Name, Party, Votes received, Rank
     - **Electoral metrics**: Vote Share, Margin, ENOP (Effective Number of Parties)
     
-    Upload your electoral data or provide a path to your CSV file to get started.
+    Select from available datasets or upload your own electoral data CSV file.
     """)
-    
-    # Sidebar for configuration
-    with st.sidebar:
-        st.header("Configuration")
-        
-        # File uploader for CSV
-        uploaded_file = st.file_uploader("Upload CSV file", type=["csv", "tsv", "txt"])
-        
-        # # API Key input
-        # api_key = st.text_input("Groq API Key", 
-        #                        value=os.environ.get("GROQ_API_KEY", ""), 
-        #                        type="password",
-        #                        help="Enter your Groq API key. It will be saved to session state.")
-        
-        # if api_key:
-        #     os.environ["GROQ_API_KEY"] = api_key
-        
-        st.divider()
-        st.markdown("### Example Questions")
-        example_questions = [
-            "Show candidates who won with highest vote share percentage",
-            "What was the average margin of victory by party?",
-            "Compare performance of BJP vs INC across all constituencies",
-            "Show districts where BSP candidates ranked 3rd"
-        ]   
-        
-        for question in example_questions:
-            if st.button(question):
-                st.session_state.user_query = question
     
     # Initialize session state
     if "analyzer" not in st.session_state:
@@ -443,38 +674,68 @@ def main():
     if "user_query" not in st.session_state:
         st.session_state.user_query = ""
     
-    # Process uploaded file
-    if uploaded_file is not None:
-        # Save uploaded file to disk temporarily
-        temp_file_path = f"temp_{uploaded_file.name}"
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # Initialize analyzer with the uploaded file
-        st.session_state.analyzer = ElectoralDataAnalyzer(temp_file_path)
-    elif "analyzer" not in st.session_state or st.session_state.analyzer is None:
-        # Default path prompt
-        default_path = "electoral_data.csv"
-        csv_path = st.text_input("Enter path to CSV/TSV file:", default_path, 
-                                help="Enter the path to your tab-separated or comma-separated electoral data file")
-        
-        file_type = st.radio(
-            "Select file type:",
-            ["CSV (comma-separated)", "TSV (tab-separated)"],
-            index=1,  # Default to TSV since your sample is tab-separated
-            horizontal=True
-        )
-        
-        if st.button("Load Data"):
-            if os.path.exists(csv_path):
-                st.session_state.analyzer = ElectoralDataAnalyzer(csv_path)
+    if "active_dataset" not in st.session_state:
+        st.session_state.active_dataset = None
+    
+    # Define available datasets with correct paths
+    available_datasets = {
+        "General Election Data": "General ELection UP 2014_19_24 .csv",
+        "State Election Data": "Assembly Election UP 2012_17_22 .csv"
+    }
+    
+    # Dataset selection in main area
+    st.header("Choose a dataset to analyze:")
+    dataset_cols = st.columns(2)
+    
+    with dataset_cols[0]:
+        if st.button("General Election Data", use_container_width=True):
+            selected_path = available_datasets["General Election Data"]
+            if os.path.exists(selected_path):
+                st.session_state.analyzer = ElectoralDataAnalyzer(selected_path)
+                st.session_state.active_dataset = "General Election Data"
             else:
-                st.error(f"File not found: {csv_path}")
-                st.info("Please make sure the file exists in the correct location and that you've entered the path correctly.")
-                st.markdown("**Tip**: If you're running this in a notebook or IDE, make sure the working directory is set correctly.")
+                st.error(f"Dataset file not found: {selected_path}")
+    
+    with dataset_cols[1]:
+        if st.button("State Election Data", use_container_width=True):
+            selected_path = available_datasets["State Election Data"]
+            if os.path.exists(selected_path):
+                st.session_state.analyzer = ElectoralDataAnalyzer(selected_path)
+                st.session_state.active_dataset = "State Election Data"
+            else:
+                st.error(f"Dataset file not found: {selected_path}")
+    
+    # Display example questions in the main area
+    if st.session_state.analyzer is not None:
+        st.markdown("### Example Questions")
+        
+        # Create a 2x2 grid of example questions
+        col1, col2 = st.columns(2)
+        
+        example_questions = [
+            "Show candidates who won with highest vote share percentage",
+            "What was the average margin of victory by party?",
+            "Compare performance of BJP vs INC across all constituencies",
+            "Show districts where candidates ranked 3rd"
+        ]
+        
+        with col1:
+            if st.button(example_questions[0]):
+                st.session_state.user_query = example_questions[0]
+            if st.button(example_questions[2]):
+                st.session_state.user_query = example_questions[2]
+        
+        with col2:
+            if st.button(example_questions[1]):
+                st.session_state.user_query = example_questions[1]
+            if st.button(example_questions[3]):
+                st.session_state.user_query = example_questions[3]
     
     # Display dataframe if analyzer is initialized
     if st.session_state.analyzer is not None and hasattr(st.session_state.analyzer, 'df'):
+        # Display active dataset info
+        st.info(f"Active Dataset: {st.session_state.active_dataset}")
+        
         with st.expander("Preview of loaded data"):
             st.dataframe(st.session_state.analyzer.df.head(10))
             
@@ -486,7 +747,8 @@ def main():
         # Input for question
         query_input = st.text_input("Ask a question about the electoral data:",
                                    value=st.session_state.user_query,
-                                   key="query_input")
+                                   key="query_input",
+                                   placeholder="Example: Who won with the highest margin?")
         
         # Button to submit question
         if st.button("Analyze") or st.session_state.user_query:
@@ -495,40 +757,116 @@ def main():
                 current_query = query_input
                 st.session_state.user_query = ""  # Reset for next query
                 
+                # Create tabs for different display formats
+                result_tabs = st.tabs(["SQL Results", "Visualization", "Gemini Analysis", "Candidate Info"])
+                
                 # Execute query
                 result = st.session_state.analyzer.execute_query_with_llm(current_query)
-                
-                # Display results
-                if isinstance(result, dict):
-                    if "error" in result:
-                        st.error(result["error"])
-                    else:
-                        # Show SQL Query
-                        st.subheader("SQL Query")
-                        st.code(result["query"], language="sql")
-                        
-                        # Show Results
-                        st.subheader("Query Results")
-                        if isinstance(result["result"], pd.DataFrame):
-                            st.dataframe(result["result"])
-                            
-                            # Add download button for results
-                            csv = result["result"].to_csv(index=False)
-                            st.download_button(
-                                label="Download results as CSV",
-                                data=csv,
-                                file_name="query_results.csv",
-                                mime="text/csv",
-                            )
+
+                # Handle result in the first tab (SQL Results)
+                with result_tabs[0]:
+                    if isinstance(result, dict):
+                        if "error" in result:
+                            st.error(result["error"])
                         else:
-                            st.text(result["result"])
+                            # Show SQL Query
+                            st.subheader("SQL Query")
+                            st.code(result["query"], language="sql")
+                            
+                            # Show Results
+                            st.subheader("Query Results")
+                            if isinstance(result["result"], pd.DataFrame):
+                                st.dataframe(result["result"])
+                                
+                                # Add download button for results
+                                csv = result["result"].to_csv(index=False)
+                                st.download_button(
+                                    label="Download results as CSV",
+                                    data=csv,
+                                    file_name="query_results.csv",
+                                    mime="text/csv",
+                                )
+                            else:
+                                st.text(result["result"])
+                            
+                            # Show Explanation
+                            if result["explanation"]:
+                                st.subheader("Explanation")
+                                st.markdown(result["explanation"])
+                    else:
+                        st.error("An error occurred processing your query.")
+                
+                # Handle visualization in the second tab
+                with result_tabs[1]:
+                    if isinstance(result, dict) and "result" in result and isinstance(result["result"], pd.DataFrame):
+                        st.subheader("Visualization")
                         
-                        # Show Explanation
-                        if result["explanation"]:
-                            st.subheader("Explanation")
-                            st.markdown(result["explanation"])
-                else:
-                    st.error("An error occurred processing your query.")
+                        # Generate appropriate visualization based on data
+                        fig = st.session_state.analyzer.generate_visualization(result["result"], current_query)
+                        
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No suitable visualization could be generated for this query result.")
+                            
+                            # Show a table as fallback
+                            st.dataframe(result["result"])
+                    else:
+                        st.info("No data available for visualization.")
+                
+                # Handle Gemini Analysis in the third tab
+                with result_tabs[2]:
+                    st.subheader("Gemini AI Analysis")
+                    
+                    if isinstance(result, dict) and "result" in result and isinstance(result["result"], pd.DataFrame):
+                        # Generate analysis with Gemini
+                        gemini_analysis = st.session_state.analyzer.generate_gemini_analysis(
+                            current_query, result["result"]
+                        )
+                        
+                        if gemini_analysis:
+                            st.markdown(gemini_analysis)
+                        else:
+                            st.info("Gemini AI analysis could not be generated.")
+                    else:
+                        st.info("No data available for Gemini AI analysis.")
+                
+                # Handle Candidate Information in the fourth tab
+                with result_tabs[3]:
+                    st.subheader("Candidate Information")
+                    
+                    if isinstance(result, dict) and "result" in result and isinstance(result["result"], pd.DataFrame):
+                        # Check if there are candidate names in the result
+                        candidate_cols = [col for col in result["result"].columns 
+                                         if "candidate" in col.lower() or "name" in col.lower()]
+                        
+                        if candidate_cols:
+                            candidate_col = candidate_cols[0]
+                            candidates = result["result"][candidate_col].unique()
+                            
+                            if len(candidates) > 0:
+                                # Let user choose a candidate to get info about
+                                selected_candidate = st.selectbox(
+                                    "Select a candidate to view information:",
+                                    candidates
+                                )
+                                
+                                if selected_candidate:
+                                    with st.spinner(f"Fetching information about {selected_candidate}..."):
+                                        candidate_info = st.session_state.analyzer.get_candidate_info(selected_candidate)
+                                        
+                                        if isinstance(candidate_info, dict):
+                                            st.subheader(candidate_info["name"])
+                                            st.markdown(candidate_info["summary"])
+                                            st.markdown(f"[Read more on Wikipedia]({candidate_info['url']})")
+                                        else:
+                                            st.info(candidate_info)
+                            else:
+                                st.info("No candidate names found in the result.")
+                        else:
+                            st.info("No candidate names found in the query result.")
+                    else:
+                        st.info("No candidate data available.")
 
 if __name__ == "__main__":
     main()
